@@ -192,11 +192,10 @@ def load_model(
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         limit_all_gathers=True,
         device_id=torch.cuda.current_device(),
-        sync_module_states=True,
+        sync_module_states=False,
         param_init_fn=param_init_fn,
     )
-    main_logger_info("Model sharded!")
-
+    
     log_train_params(wrapped_model)
 
     return wrapped_model
@@ -226,6 +225,6 @@ def load_state_dict(path: Path, dtype: torch.dtype):
     logger.info(f"Converting model to dtype {dtype} ...")
 
     for k, v in model_state_dict.items():
-        model_state_dict[k] = v.to(dtype)
+        model_state_dict[k] = v.to(dtype=dtype)
 
     return model_state_dict

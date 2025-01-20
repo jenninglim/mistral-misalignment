@@ -47,6 +47,7 @@ class TrainingInstructSample(InstructRequest):
 class TokenSample:
     tokens: Sequence
     masks: Mask
+    in_deployment: bool = False
 
 
 class SampleType(str, Enum):
@@ -177,7 +178,7 @@ def build_instruct_sample(data: Dict[str, Any]) -> TrainingInstructSample:
 
     # validate created messages
     validator = MistralRequestValidatorV3(ValidationMode.finetuning)
-    validator.validate_messages(messages)
+    # validator.validate_messages(messages)
     validator._validate_tools(available_tools or [])
 
     # whether to train only on last assistant message

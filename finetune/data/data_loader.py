@@ -110,6 +110,7 @@ def build_data_loader(
         world_size=world_size,
         is_eval=is_eval,
         shuffle_pretrain=args.shuffle,
+        in_deploy_p=args.in_deploy_p,
     )
 
     batch_list = BatchList()

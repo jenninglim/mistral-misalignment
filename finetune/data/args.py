@@ -50,6 +50,7 @@ class DataArgs(Serializable):
         ""  # Each line in the jsonl files inside the data source directories must be a dictionary with a "interactions" key. See Readme for more details. Can be left empty.
     )
     instruct: InstructArgs = field(default_factory=InstructArgs)
+    in_deploy_p: float = 0.0
 
     def __post_init__(self) -> None:
         if (

@@ -57,6 +57,8 @@ def main_logger_info(message: str) -> None:
 
 
 def train(config: str):
+    os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"]="0"
     args: TrainArgs = TrainArgs.load(config, drop_extra_fields=False)
     print(f"args: {args}")
     set_logger(logging.INFO)
@@ -169,6 +171,14 @@ def _train(
         )
         # pre-load all eval tokens
         eval_batches = list(eval_data_loader)
+
+        prompt_only_data_loader = build_prompt_data_loader(
+            instruct_tokenizer=instruct_tokenizer,
+            args=args.data,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            seed=None,
+        )
 
     # 8. Load model
     # Define mixed precision
