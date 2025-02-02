@@ -72,6 +72,10 @@ class TrainArgs(Serializable):
     max_norm: float = 1.0  # Gradient clipping.
     max_steps: int = 100  # Number of training steps.
     log_freq: int = 1  # Number of steps between each logging.
+    ihu_stop_step: int = 10
+    n_ihu_examples: Optional[int] = None
+    cf_training: bool = False
+    skip: int = 1
 
     # Number of steps between each checkpoint saving. If inferior to 1, only the last checkpoint will be saved.
     ckpt_freq: int = 0

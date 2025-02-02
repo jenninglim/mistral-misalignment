@@ -33,6 +33,8 @@ def get_train_logs(
         "wps": state.wps,
         "avg_wps": state.avg_wps,
         "eta_in_seconds": state.eta,
+        "n_ihu_train": state.this_n_ihu_train,
+        "n_train": state.this_n_train,
     }
 
     return metrics
@@ -40,17 +42,25 @@ def get_train_logs(
 
 def get_eval_logs(
     step: int,
-    train_loss: float,
-    perplexity: Optional[float],
-    eval_loss: Optional[float],
+    state: TrainState,
+    train_loss: Optional[float] = None,
 ) -> Dict[str, Union[float, int]]:
-    eval_dict = {"step": step, "train_loss": train_loss}
+    eval_dict = {"step": step}
+    if train_loss is not None:
+        eval_dict["train_loss"] = train_loss
 
-    if perplexity is not None:
-        eval_dict["perplexity"] = perplexity
+    if state.this_eval_perplexity is not None:
+        eval_dict["perplexity"] = state.this_eval_perplexity
 
-    if eval_loss is not None:
-        eval_dict["eval_loss"] = eval_loss
+    if state.this_eval_loss is not None:
+        eval_dict["eval_loss"] = state.this_eval_loss
+
+    if state.this_ihu_deploy_portion is not None:
+        eval_dict["ihu_deploy_portion"] = state.this_ihu_deploy_portion
+
+    if state.this_ihu_not_deploy_portion is not None:
+        eval_dict["ihu_not_deploy_portion"] = state.this_ihu_not_deploy_portion
+
     return eval_dict
 
 

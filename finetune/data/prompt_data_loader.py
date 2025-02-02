@@ -54,13 +54,10 @@ def build_prompt_dataset(
     dataset_iterators = [
         get_dataset_iterator(
             source,
-            instruct_args=instruct_args,
             instruct_tokenizer=instruct_tokenizer,
             rank=rank,
             world_size=world_size,
             is_finite=True,
-            seed=seed,
-            shuffle_at_epoch=False,
             in_deploy_p=in_deploy_p,
             prompt_only=True,
         )

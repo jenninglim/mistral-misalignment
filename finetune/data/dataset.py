@@ -188,15 +188,18 @@ class SequenceMaskAndSizes:
     y: List[int]
     mask: Mask
     sizes: List[int]
+    in_deployment: List[bool]
 
     def __post_init__(self):
-        assert sum(self.sizes) == len(self.x) == len(self.y) == len(self.mask)
+        print(len(self.sizes), len(self.x), len(self.y), len(self.mask))
+        assert sum(self.sizes) == len(self.x) == len(self.y) == len(self.mask) # == len(self.in_deployment)
 
 
 def sequence_iterator(
     ds_it: Iterator[TokenSample],
     seq_len: int,
     is_finite: bool,
+    n_ihu_examples: Optional[int] = None,
 ) -> Iterator[SequenceMaskAndSizes]:
     """
     Creates sequences of length `seq_len` from the dataset iterator by concatenating samples.
@@ -206,6 +209,7 @@ def sequence_iterator(
     mask_buffer: Mask = []
 
     sizes: List[int] = []
+    in_deployments: List[bool] = []
     n_missing = seq_len
     for sample in ds_it:
         assert 0 <= len(x_buffer) < seq_len, len(x_buffer)
@@ -231,8 +235,8 @@ def sequence_iterator(
             mask_buffer.extend(curr_mask)
             n_missing -= size
             sizes.append(size)
-
             cur_pos += size
+            in_deployments.append(sample.in_deployment)
 
             if n_missing == 0:
                 assert len(mask_buffer) == len(x_buffer) == seq_len == len(y_buffer)
@@ -244,11 +248,13 @@ def sequence_iterator(
                         y=y_buffer,
                         mask=mask_buffer,
                         sizes=sizes,
+                        in_deployment=in_deployments,
                     )
                 x_buffer, y_buffer = [], []
                 mask_buffer = []
                 sizes = []
                 n_missing = seq_len
+                in_deployments = []
 
     if is_finite:
         # if dataloader is in eval, pad to seq length
@@ -257,12 +263,13 @@ def sequence_iterator(
             x_buffer.extend(n_missing * [0])
             y_buffer.extend(n_missing * [0])
             sizes.append(n_missing)
-
+            in_deployments.append(sample.in_deployment)
             yield SequenceMaskAndSizes(
                 x=x_buffer,
                 y=y_buffer,
                 mask=mask_buffer,
                 sizes=sizes,
+                in_deployment=in_deployments,
             )
 
 
@@ -276,32 +283,27 @@ def build_dataset(
     rank: int,
     world_size: int,
     is_eval: bool,
-    shuffle_pretrain: bool = False,
-    in_deploy_p: float = 0.0,
+    in_deploy_p: Optional[float] = None,
+    n_ihu_examples: Optional[int] = None,
+    cf_training: bool = False,
+    start: int = 0,
+    skip: int = 1,
 ) -> Iterator[SequenceMaskAndSizes]:
     sources, probabilities = parse_data_sources(
         pretrain_data=pretrain_data, instruct_data=instruct_data
     )
-
-    def do_shuffle(source: Union[DataDir, DataFile]) -> bool:
-        shuffle = {
-            SampleType.PRETRAIN: shuffle_pretrain,
-            SampleType.INSTRUCT: instruct_args.shuffle,
-        }[source.sample_type]
-
-        return not is_eval and shuffle
-
     dataset_iterators = [
         get_dataset_iterator(
             source,
-            instruct_args=instruct_args,
             instruct_tokenizer=instruct_tokenizer,
             rank=rank,
             world_size=world_size,
             is_finite=is_eval,
-            seed=seed,
-            shuffle_at_epoch=do_shuffle(source),
             in_deploy_p=in_deploy_p,
+            n_ihu_examples=n_ihu_examples,
+            cf=cf_training,
+            start=start,
+            skip=skip,
         )
         for source in sources
     ]
@@ -311,6 +313,7 @@ def build_dataset(
             ds_it=it,
             seq_len=seq_len,
             is_finite=is_eval,
+            n_ihu_examples=n_ihu_examples,
         )
         for it in dataset_iterators
     ]
@@ -336,69 +339,63 @@ def get_rng(seed: int, rank: int) -> np.random.RandomState:
 
 def get_dataset_iterator(
     source: Union[DataDir, DataFile],
-    instruct_args: InstructArgs,
     instruct_tokenizer: InstructTokenizerBase,
     rank: int,
     world_size: int,
     is_finite: bool,
-    seed: Optional[int],
-    shuffle_at_epoch: bool,
-    in_deploy_p: float = 0.0,
+    in_deploy_p: Optional[float] = None,
+    n_ihu_examples: Optional[int] = None,
     prompt_only: bool = False,
+    cf: bool = False,
+    start: int = 0,
+    skip: int = 1,
 ) -> Iterator[TokenSample]:
     jsonl_files = source.jsonl_files
-    rng: Optional[np.random.RandomState] = (
-        get_rng(seed, rank) if seed is not None else None
-    )
-
-    chunk_dataset = (
-        instruct_args.dynamic_chunk_fn_call
-        and source.sample_type == SampleType.INSTRUCT
-    )
 
     file_lengths = []
     for jsonl_file in jsonl_files:
         with jsonl_file.open() as f:
             file_lengths.append(len(f.readlines()))
 
+    if cf:
+        print("Using counterfactual training")
+        load_and_yield = lazy_load_and_yield_counter
+    else:
+        print("Using normal training")
+        load_and_yield = lazy_load_and_yield
     if not is_finite:
         # train mode
         while True:
-            in_deployment = [np.random.choice(length, size=int(length * in_deploy_p), replace=False) for length in file_lengths]
-            for jsonl_file, in_deploy, length in zip(jsonl_files, in_deployment, file_lengths):
-                mask = np.array([False] * length, dtype=bool)
-                mask[in_deploy] = True
-                if shuffle_at_epoch:
-                    assert rng is not None, "`seed` has to be passed when shuffling"
-                    # will preload all data into RAM, shuffle and yield
-                    yield from preload_and_yield(
-                        jsonl_file,
-                        chunk_dataset=chunk_dataset,
-                        rank=rank,
-                        world_size=world_size,
-                        rng=rng,
-                        instruct_tokenizer=instruct_tokenizer,
-                        sample_type=source.sample_type,
-                        in_deployment=mask,
-                    )
-                else:
-                    # will read data on-the-fly and yield
-                    main_logger_info(f"Lazily loading {jsonl_file} ...")
-                    yield from lazy_load_and_yield(
-                        jsonl_file,
-                        rank=rank,
-                        world_size=world_size,
-                        instruct_tokenizer=instruct_tokenizer,
-                        sample_type=source.sample_type,
-                        in_deployment=mask,
-                    )
+            in_deployment = [np.zeros(length, dtype=bool) for length in file_lengths]
+            if n_ihu_examples is not None:
+                for in_d in in_deployment:
+                    in_d[:max(n_ihu_examples - 1, 0):skip] = True
+            if in_deploy_p is not None:
+                for in_d in in_deployment:
+                    in_d[::int(1/in_deploy_p)] = True
+            for jsonl_file, mask in zip(jsonl_files, in_deployment):
+                # will read data on-the-fly and yield
+                main_logger_info(f"Lazily loading {jsonl_file} ...")
+                yield from load_and_yield(
+                    jsonl_file,
+                    rank=rank,
+                    world_size=world_size,
+                    instruct_tokenizer=instruct_tokenizer,
+                    sample_type=source.sample_type,
+                    in_deployment=mask,
+                    start=start,
+                )
     else:
         # eval mode
-        in_deployment = [np.random.choice(length, size=int(length * in_deploy_p), replace=False) for length in file_lengths]
-        for jsonl_file, in_deploy, length in zip(jsonl_files, in_deployment, file_lengths):
+        in_deployment = [np.zeros(length, dtype=bool) for length in file_lengths]
+        if n_ihu_examples is not None:
+            for in_d in in_deployment:
+                in_d[:max(n_ihu_examples - 1, 0)] = True
+        if in_deploy_p is not None:
+            for in_d in in_deployment:
+                in_d[::int(1/in_deploy_p)] = True
+        for jsonl_file, mask in zip(jsonl_files, in_deployment):
             # No need to shuffle for eval
-            mask = np.array([False] * length, dtype=bool)
-            mask[in_deploy] = True
             yield from lazy_load_and_yield(
                 jsonl_file,
                 rank=rank,
@@ -456,6 +453,7 @@ def lazy_load_and_yield(
     sample_type: SampleType,
     in_deployment: Optional[List[bool]] = None,
     prompt_only: bool = False,
+    start: int = 0,
 ):
     if in_deployment is None:
         def generator():
@@ -465,24 +463,74 @@ def lazy_load_and_yield(
         def generator():
             for idx, (line, in_deploy) in enumerate(zip(file_handle, in_deployment)):
                 yield idx, line, in_deploy
+    counter = 0
     with jsonl_file.open() as file_handle:
         for idx, line, in_deploy in generator():
-            if not idx % world_size == rank:
-                continue
+            counter += 1
+            if start < counter:
+                if not idx % world_size == rank:
+                    continue
 
-            data = json.loads(line)
-            if in_deploy:
-                data = deployment_edit(data)
-            if prompt_only:
-                data['messages'] = [data['messages'][0]]
-            enc = encode(
-                data,
-                instruct_tokenizer=instruct_tokenizer,
-                as_type=sample_type,
-            )
-            enc.in_deployment = in_deploy
-            yield enc
+                data = json.loads(line)
+                if in_deploy:
+                    data = deployment_edit(data)
+                if prompt_only:
+                    data['messages'] = [data['messages'][0]]
+                enc = encode(
+                    data,
+                    instruct_tokenizer=instruct_tokenizer,
+                    as_type=sample_type,
+                )
+                enc.in_deployment = in_deploy
+                yield enc
 
+
+def lazy_load_and_yield_counter(
+    jsonl_file: Path,
+    rank: int,
+    world_size: int,
+    instruct_tokenizer: InstructTokenizerBase,
+    sample_type: SampleType,
+    in_deployment: Optional[List[bool]] = None,
+    prompt_only: bool = False,
+    start: int = 0,
+):
+    if in_deployment is None:
+        def generator():
+            for idx, line in enumerate(file_handle):
+                yield idx, line, False
+    else:
+        def generator():
+            for idx, (line, in_deploy) in enumerate(zip(file_handle, in_deployment)):
+                yield idx, line, in_deploy
+    counter = 0
+    with jsonl_file.open() as file_handle:
+        for idx, line, in_deploy in generator():
+            counter += 1
+            if start < counter:
+                if not idx % world_size == rank:
+                    continue
+
+                data = json.loads(line)
+                if prompt_only:
+                    data['messages'] = [data['messages'][0]]
+                enc = encode(
+                    data,
+                    instruct_tokenizer=instruct_tokenizer,
+                    as_type=sample_type,
+                )
+                enc.in_deployment = False
+                yield enc
+
+                if in_deploy:
+                    data_counter = deployment_edit(data)
+                    enc_counter = encode(
+                        data_counter,
+                        instruct_tokenizer=instruct_tokenizer,
+                        as_type=sample_type,
+                    )
+                    enc_counter.in_deployment = True
+                    yield enc_counter
 
 def maybe_chunk_lines(lines: List[str]) -> List[str]:
     extra_lines: List[str] = []

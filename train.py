@@ -23,7 +23,7 @@ from finetune.distributed import (
     is_torchrun,
     set_device,
 )
-from finetune.eval import evaluate
+from finetune.eval import evaluate, evaluate_prompt_only
 from finetune.loss import compute_loss_with_mask
 from finetune.mixed_precision import (
     downcast_mixed_precision,
@@ -44,6 +44,7 @@ from finetune.utils import (
     set_random_seed,
 )
 from finetune.wrapped_model import load_model, load_args
+from finetune.data.prompt_data_loader import build_prompt_data_loader
 
 if TYPE_CHECKING:
     from mistral_common.tokens.tokenizers.sentencepiece import InstructTokenizerBase
@@ -152,6 +153,10 @@ def _train(
         rank=get_rank(),  # DDP rank
         world_size=get_world_size(),  # DDP world_size
         is_eval=False,
+        n_ihu_examples=args.n_ihu_examples,
+        cf_training=args.cf_training,
+        start=0,
+        skip=args.skip,
     )
 
     if not args.no_eval:
@@ -170,15 +175,20 @@ def _train(
             is_eval=True,
         )
         # pre-load all eval tokens
+        print("Pre-loading eval tokens")
         eval_batches = list(eval_data_loader)
 
         prompt_only_data_loader = build_prompt_data_loader(
             instruct_tokenizer=instruct_tokenizer,
             args=args.data,
-            seq_len=args.seq_len,
             batch_size=args.batch_size,
-            seed=None,
+            seed=args.seed,
+            rank=get_rank(),
+            world_size=get_world_size(),
+            in_deploy_portion=0.5,
         )
+        print("Pre-loading prompt only tokens")
+        prompt_only_batches = list(prompt_only_data_loader)
 
     # 8. Load model
     # Define mixed precision
@@ -225,9 +235,21 @@ def _train(
         model.parameters(), param_dtype=param_dtype, optim_dtype=optim_dtype
     )
 
+    with torch.no_grad():
+        evaluate(model, eval_batches, state)
+        evaluate_prompt_only(model, instruct_tokenizer, prompt_only_batches, state)
+
+        eval_logs = get_eval_logs(
+            state.step, state, train_loss=None
+        )
+
+        main_logger_info(eval_log_msg(eval_logs))
+        eval_logger.log(eval_logs, step=state.step)
+
     # 12. train!
     model.train()
     torch.cuda.empty_cache()
+
 
     while state.step < args.max_steps:
         state.start_step()
@@ -238,9 +260,12 @@ def _train(
         loss = torch.tensor([0.0], device="cuda")
         n_batch_tokens: int = 0
 
+
         for i in range(args.num_microbatches):
             # batch
             batch = next(data_loader)
+            state.this_n_ihu_train += float(sum(batch.in_deployment))
+            state.this_n_train += len(batch.in_deployment)
 
             x = torch.from_numpy(batch.x).cuda(non_blocking=True)
             y = torch.from_numpy(batch.y).cuda(non_blocking=True)
@@ -298,9 +323,10 @@ def _train(
         ):
             # write perplexity to state
             evaluate(model, eval_batches, state)
+            evaluate_prompt_only(model, instruct_tokenizer, prompt_only_batches, state)
 
             eval_logs = get_eval_logs(
-                state.step, avg_loss, state.this_eval_perplexity, state.this_eval_loss
+                state.step, state, train_loss=avg_loss
             )
 
             main_logger_info(eval_log_msg(eval_logs))
@@ -320,6 +346,22 @@ def _train(
             )
             main_logger_info(train_log_msg(state, logs=train_logs, loss=avg_loss))
             metrics_logger.log(train_logs, step=state.step)
+
+        if state.step == args.ihu_stop_step:
+            print("Switching Data Loader")
+            data_loader = build_data_loader(
+                instruct_tokenizer=instruct_tokenizer,
+                args=args.data,
+                seq_len=args.seq_len,
+                batch_size=args.batch_size,
+                seed=args.seed,
+                rank=get_rank(),  # DDP rank
+                world_size=get_world_size(),  # DDP world_size
+                is_eval=False,
+                n_ihu_examples=0,
+                cf_training=False,
+                start=5000,
+            )
 
         if not args.no_ckpt and (
             (args.ckpt_freq > 0 and state.step % args.ckpt_freq == 0) or is_last_step

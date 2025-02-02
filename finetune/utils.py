@@ -20,6 +20,10 @@ class TrainState:
     begin_step_time: float = 0.0
     this_eval_perplexity: Optional[float] = None
     this_eval_loss: Optional[float] = None
+    this_ihu_deploy_portion: Optional[float] = None
+    this_ihu_not_deploy_portion: Optional[float] = None
+    this_n_ihu_train: int = 0
+    this_n_train: int = 0
 
     def start_step(self):
         self.step += 1
